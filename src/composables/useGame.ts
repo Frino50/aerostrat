@@ -1,6 +1,12 @@
 import { ref, reactive } from 'vue'
 import type { Base, Bullet, EntityType, CardType } from '../types/game'
 import { BUILDING_TYPES, BUILDING_LIMITS, COSTS } from '../types/game'
+import { unlockedCards, passiveBonuses, activeMission, difficultyMult, awardXp, playSfx, meta } from './useMeta'
+
+// Active enemy multipliers (refreshed in resetGame). Default = 1 (skirmish + normal).
+let enemyHpMult = 1
+let enemyDamageMult = 1
+let enemyIncomeMult = 1
 
 // ── State ──
 export const money = ref(500)
@@ -38,6 +44,8 @@ let viewportWidth = window.innerWidth
 let viewportHeight = window.innerHeight
 let resizeHandler: (() => void) | null = null
 let mouseDownHandler: ((e: MouseEvent) => void) | null = null
+let loopRunning = false
+let rafId: number | null = null
 
 export function getBuildingCount(type: string, team: string) {
   return units.filter(u => u.type === type && u.team === team).length
@@ -58,7 +66,12 @@ export function enemyHpPercent() {
   return Math.ceil(Math.max(0, enemyBase.hp) / enemyBase.maxHp * 100)
 }
 
+export function isCardLocked(type: CardType): boolean {
+  return !unlockedCards.value.has(type)
+}
+
 export function isCardDisabled(type: CardType): boolean {
+  if (isCardLocked(type)) return true
   if (money.value < COSTS[type]) return true
   if (BUILDING_TYPES.has(type as EntityType)) {
     return getBuildingCount(type, 'player') >= (BUILDING_LIMITS[type] || 5)
@@ -134,7 +147,9 @@ class Unit {
       wall: { hp: 2000, speed: 0, range: 0, radius: 20, fireRate: 0 },
     }
     const stats = s[type] || { hp: 60, speed: 2, range: 180, radius: 10, fireRate: 35 }
-    this.hp = stats.hp; this.maxHp = stats.hp; this.speed = stats.speed
+    let baseHp = stats.hp
+    if (team === 'enemy') baseHp = Math.ceil(baseHp * enemyHpMult)
+    this.hp = baseHp; this.maxHp = baseHp; this.speed = stats.speed
     this.range = stats.range; this.radius = stats.radius; this.fireRate = stats.fireRate
 
     const colors: Record<string, string> = {
@@ -268,6 +283,7 @@ class Unit {
     else if (this.type === 'scout') { dmg = 8; bs = 12; bsz = 2 }
     else if (this.type === 'bunker') { dmg = 20; bs = 10; bsz = 5 }
     if (this.radarBuff) dmg = Math.ceil(dmg * 1.15)
+    if (this.team === 'enemy') dmg = Math.ceil(dmg * enemyDamageMult)
     bullets.push({
       x: this.x + Math.cos(this.angle) * this.radius,
       y: this.y + Math.sin(this.angle) * this.radius,
@@ -407,14 +423,16 @@ function drawBase(ctx: CanvasRenderingContext2D, base: Base, isPlayer: boolean) 
 
 // ── Actions ──
 export function spawnUnit(type: string) {
-  if (money.value < COSTS[type as CardType]) { showNotif('⚠ Crédits insuffisants'); return }
+  if (isCardLocked(type as CardType)) { showNotif('🔒 Unité verrouillée — débloque-la dans l\'arbre'); playSfx('error'); return }
+  if (money.value < COSTS[type as CardType]) { showNotif('⚠ Crédits insuffisants'); playSfx('error'); return }
   if (BUILDING_TYPES.has(type as EntityType)) {
     const limit = BUILDING_LIMITS[type] || 5
     const count = getBuildingCount(type, 'player')
-    if (count >= limit) { showNotif(`⚠ Limite ${type} atteinte (${limit})`); return }
+    if (count >= limit) { showNotif(`⚠ Limite ${type} atteinte (${limit})`); playSfx('error'); return }
   }
   money.value -= COSTS[type as CardType]
   units.push(new Unit(playerBase.x, playerBase.y, 'player', type))
+  playSfx('click')
 }
 
 export function toggleOrbital() {
@@ -569,20 +587,43 @@ function gameLoop() {
     }
   }
 
+  if (!loopRunning) return
   if (playerBase.hp > 0 && enemyBase.hp > 0) {
-    requestAnimationFrame(gameLoop)
+    rafId = requestAnimationFrame(gameLoop)
   } else {
     gameRunning.value = false
     endWon.value = playerBase.hp > 0
     endTitle.value = endWon.value ? 'VICTOIRE !' : 'DÉFAITE'
     endScreenVisible.value = true
     ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, viewportWidth, viewportHeight)
+    if (!endRewardGiven) {
+      endRewardGiven = true
+      if (endWon.value) {
+        playSfx('victory')
+        const m = activeMission.mission
+        if (m) {
+          awardXp(m.xp)
+          // Advance campaign progress if this mission was the next one
+          if (meta.campaignProgress < m.id) meta.campaignProgress = m.id
+          lastReward.value = m.xp
+        } else {
+          // Skirmish gives a small XP reward
+          awardXp(20)
+          lastReward.value = 20
+        }
+      } else {
+        playSfx('defeat')
+        lastReward.value = 0
+      }
+    }
   }
 }
 
 // ── Init ──
 let incomeInterval: ReturnType<typeof setInterval> | null = null
 let waveInterval: ReturnType<typeof setInterval> | null = null
+let endRewardGiven = false
+export const lastReward = ref(0)
 
 export function initGame(canvas: HTMLCanvasElement, bottomPanelHeight: number) {
   cleanupGame()
@@ -645,20 +686,35 @@ export function initGame(canvas: HTMLCanvasElement, bottomPanelHeight: number) {
   waveInterval = setInterval(() => {
     if (!gameRunning.value) return
     waveNum.value++
-    enemyIncomePerSecond.value = Math.min(40, 15 + waveNum.value * 3)
+    enemyIncomePerSecond.value = Math.round(Math.min(40, 15 + waveNum.value * 3) * enemyIncomeMult)
     showNotif(`⚠ VAGUE ${waveNum.value} — OFFENSIVE ENNEMIE RENFORCÉE`)
   }, 30000)
 
-  gameLoop()
+  loopRunning = true
+  rafId = requestAnimationFrame(gameLoop)
 }
 
 export function resetGame() {
   cleanupGame()
 
-  money.value = 500
-  enemyMoney.value = 500
-  incomePerSecond.value = 15
-  enemyIncomePerSecond.value = 15
+  // Apply mission + difficulty multipliers to the enemy bot
+  const diff = difficultyMult()
+  const m = activeMission.mission
+  enemyHpMult = (m ? m.enemyHpMult : 1) * diff.hp
+  enemyDamageMult = (m ? m.enemyDamageMult : 1) * diff.dmg
+  enemyIncomeMult = (m ? m.enemyIncomeMult : 1) * diff.income
+
+  // Apply player passive bonuses (from tech tree)
+  const pb = passiveBonuses.value
+  money.value = 500 + pb.startMoney
+  enemyMoney.value = 500 + (m ? m.enemyStartingBonus : 0)
+  incomePerSecond.value = 15 + pb.income
+  enemyIncomePerSecond.value = Math.round(15 * enemyIncomeMult)
+  playerBase.maxHp = 2500 + pb.baseHp
+  enemyBase.maxHp = Math.round(2500 * enemyHpMult)
+  endRewardGiven = false
+  lastReward.value = 0
+
   waveNum.value = 1
   gameRunning.value = true
   orbitalActive.value = false
@@ -675,6 +731,8 @@ export function resetGame() {
   playerBase.hp = playerBase.maxHp
   enemyBase.hp = enemyBase.maxHp
 
+  // Re-create the enemy income wave scaling using the multiplier
+
   units.length = 0
   bullets.length = 0
   particles.length = 0
@@ -688,6 +746,8 @@ export function resetGame() {
 }
 
 export function cleanupGame() {
+  loopRunning = false
+  if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null }
   if (incomeInterval) clearInterval(incomeInterval)
   if (waveInterval) clearInterval(waveInterval)
   incomeInterval = null
